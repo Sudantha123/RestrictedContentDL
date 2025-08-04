@@ -55,45 +55,89 @@ async def cmd_exec(cmd, shell=False):
 
 async def get_media_info(path):
     try:
+        # First try to get format info
         result = await cmd_exec([
             "ffprobe", "-hide_banner", "-loglevel", "error",
-            "-print_format", "json", "-show_format", path,
+            "-print_format", "json", "-show_format", "-show_streams", path,
         ])
     except Exception as e:
-        print(f"Get Media Info: {e}. Mostly File not found! - File: {path}")
+        LOGGER(__name__).warning(f"Get Media Info: {e}. File: {path}")
         return 0, None, None
+    
     if result[0] and result[2] == 0:
-        fields = eval(result[0]).get("format")
-        if not fields:
+        try:
+            import json
+            data = json.loads(result[0])
+            
+            # Try to get duration from format first
+            duration = 0
+            if "format" in data and "duration" in data["format"]:
+                duration = round(float(data["format"]["duration"]))
+            
+            # If no duration in format, try streams
+            if duration == 0 and "streams" in data:
+                for stream in data["streams"]:
+                    if stream.get("codec_type") == "video" and "duration" in stream:
+                        duration = round(float(stream["duration"]))
+                        break
+            
+            # Get metadata tags
+            tags = data.get("format", {}).get("tags", {})
+            artist = tags.get("artist") or tags.get("ARTIST") or tags.get("Artist")
+            title = tags.get("title") or tags.get("TITLE") or tags.get("Title")
+            
+            return duration, artist, title
+            
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            LOGGER(__name__).warning(f"Failed to parse media info: {e}")
             return 0, None, None
-        duration = round(float(fields.get("duration", 0)))
-        tags = fields.get("tags", {})
-        artist = tags.get("artist") or tags.get("ARTIST") or tags.get("Artist")
-        title = tags.get("title") or tags.get("TITLE") or tags.get("Title")
-        return duration, artist, title
+    
     return 0, None, None
 
 
 async def get_video_thumbnail(video_file, duration):
+    # Ensure Assets directory exists
+    os.makedirs("Assets", exist_ok=True)
     output = os.path.join("Assets", "video_thumb.jpg")
+    
     if duration is None:
         duration = (await get_media_info(video_file))[0]
-    if not duration:
+    
+    if not duration or duration <= 0:
         duration = 3
-    duration //= 2
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-ss", str(duration), "-i", video_file,
-        "-vf", "thumbnail", "-q:v", "1", "-frames:v", "1",
-        "-threads", str(os.cpu_count() // 2), output,
-    ]
+    
+    # Try multiple timestamp positions for better thumbnail
+    timestamps = [duration // 2, duration // 4, duration // 3, 1]
+    
+    for timestamp in timestamps:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-ss", str(timestamp), "-i", video_file,
+            "-vf", "thumbnail,scale=320:240", "-q:v", "2", "-frames:v", "1",
+            "-threads", str(max(1, os.cpu_count() // 2)), "-y", output,
+        ]
+        try:
+            _, err, code = await wait_for(cmd_exec(cmd), timeout=30)
+            if code == 0 and os.path.exists(output) and os.path.getsize(output) > 0:
+                return output
+        except Exception as e:
+            LOGGER(__name__).warning(f"Thumbnail generation failed at {timestamp}s: {e}")
+            continue
+    
+    # If all attempts fail, try a simple frame extraction
     try:
-        _, err, code = await wait_for(cmd_exec(cmd), timeout=60)
-        if code != 0 or not os.path.exists(output):
-            return None
-    except:
-        return None
-    return output
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", video_file, "-vf", "scale=320:240", "-q:v", "2", 
+            "-frames:v", "1", "-y", output
+        ]
+        _, err, code = await wait_for(cmd_exec(cmd), timeout=30)
+        if code == 0 and os.path.exists(output) and os.path.getsize(output) > 0:
+            return output
+    except Exception as e:
+        LOGGER(__name__).warning(f"Final thumbnail attempt failed: {e}")
+    
+    return None
 
 
 # Generate progress bar for downloading/uploading
@@ -120,23 +164,45 @@ async def send_media(
             progress_args=progress_args,
         )
     elif media_type == "video":
-        if os.path.exists("Assets/video_thumb.jpg"):
-            os.remove("Assets/video_thumb.jpg")
-        duration = (await get_media_info(media_path))[0]
+        # Clean up any existing thumbnail
+        thumb_path = os.path.join("Assets", "video_thumb.jpg")
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
+        
+        # Get video info
+        duration, _, _ = await get_media_info(media_path)
+        
+        # Generate thumbnail
         thumb = await get_video_thumbnail(media_path, duration)
-        if thumb is not None and thumb != "none":
-            with Image.open(thumb) as img:
-                width, height = img.size
-        else:
-            width = 480
-            height = 320
-
-        if thumb == "none":
-            thumb = None
+        
+        # Get video dimensions
+        width, height = 480, 320  # Default values
+        
+        if thumb and os.path.exists(thumb):
+            try:
+                with Image.open(thumb) as img:
+                    width, height = img.size
+            except Exception as e:
+                LOGGER(__name__).warning(f"Failed to get thumbnail dimensions: {e}")
+        
+        # Try to get actual video dimensions if thumbnail failed
+        if not thumb:
+            try:
+                result = await cmd_exec([
+                    "ffprobe", "-hide_banner", "-loglevel", "error",
+                    "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                    "-of", "csv=s=x:p=0", media_path
+                ])
+                if result[0] and result[2] == 0:
+                    dimensions = result[0].strip().split('x')
+                    if len(dimensions) == 2:
+                        width, height = int(dimensions[0]), int(dimensions[1])
+            except Exception as e:
+                LOGGER(__name__).warning(f"Failed to get video dimensions: {e}")
 
         await message.reply_video(
             media_path,
-            duration=duration,
+            duration=duration if duration > 0 else None,
             width=width,
             height=height,
             thumb=thumb,

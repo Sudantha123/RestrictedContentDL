@@ -10,6 +10,10 @@ async def get_parsed_msg(text, entities):
     
 
 def getChatMsgID(link: str):
+    # Normalize HTTP to HTTPS for processing
+    if link.startswith("http://"):
+        link = link.replace("http://", "https://", 1)
+    
     linkps = link.split("/")
     chat_id, message_thread_id, message_id = None, None, None
     

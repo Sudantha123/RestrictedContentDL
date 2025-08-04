@@ -88,8 +88,9 @@ async def help_command(_, message: Message):
         "   – Send `/bdl start_link end_link` to grab a series of posts in one go.\n"
         "     💡 Example: `/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`\n"
         "**It will download all posts from ID 100 to 120.**\n\n"
-        "➤ **Requirements**\n"
-        "   – Make sure the user client is part of the chat.\n\n"
+        "➤ **Join Channels**\n"
+        "   – Send `/join <invite_link>` to join private channels/groups.\n"
+        "     💡 Example: `/join https://t.me/+xxxxxxxxxxxxx`\n\n"
         "➤ **If the bot hangs**\n"
         "   – Send `/killall` to cancel any pending downloads.\n\n"
         "➤ **Logs**\n"
@@ -212,12 +213,16 @@ async def download_media(bot: Client, message: Message):
 async def download_range(bot: Client, message: Message):
     args = message.text.split()
 
-    if len(args) != 3 or not all(arg.startswith("https://t.me/") for arg in args[1:]):
+    def is_valid_telegram_link(link):
+        return link.startswith("https://t.me/") or link.startswith("http://t.me/")
+
+    if len(args) != 3 or not all(is_valid_telegram_link(arg) for arg in args[1:]):
         await message.reply(
             "🚀 **Batch Download Process**\n"
             "`/bdl start_link end_link`\n\n"
             "💡 **Example:**\n"
-            "`/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`"
+            "`/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`\n"
+            "`/bdl http://t.me/mychannel/100 http://t.me/mychannel/120`"
         )
         return
 
@@ -282,7 +287,7 @@ async def download_range(bot: Client, message: Message):
     )
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "stats", "logs", "killall"]))
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "stats", "logs", "killall", "join"]))
 async def handle_any_message(bot: Client, message: Message):
     if message.text and not message.text.startswith("/"):
         await track_task(handle_download(bot, message, message.text))
@@ -324,6 +329,74 @@ async def logs(_, message: Message):
         await message.reply_document(document="logs.txt", caption="**Logs**")
     else:
         await message.reply("**Not exists**")
+
+
+@bot.on_message(filters.command("join") & filters.private)
+async def join_channel(_, message: Message):
+    if len(message.command) < 2:
+        await message.reply(
+            "**Please provide an invite link after the /join command.**\n\n"
+            "💡 **Example:**\n"
+            "`/join https://t.me/+xxxxxxxxxxxxx`\n"
+            "`/join https://t.me/joinchat/xxxxxxxxxxxxx`\n"
+            "`/join http://t.me/+xxxxxxxxxxxxx`\n"
+            "`/join http://t.me/joinchat/xxxxxxxxxxxxx`"
+        )
+        return
+
+    invite_link = message.command[1]
+    
+    # Validate invite link format
+    valid_formats = [
+        "https://t.me/+", "https://t.me/joinchat/",
+        "http://t.me/+", "http://t.me/joinchat/"
+    ]
+    if not any(invite_link.startswith(fmt) for fmt in valid_formats):
+        await message.reply(
+            "**❌ Invalid invite link format.**\n\n"
+            "Please use a valid Telegram invite link:\n"
+            "• `https://t.me/+xxxxxxxxxxxxx`\n"
+            "• `https://t.me/joinchat/xxxxxxxxxxxxx`\n"
+            "• `http://t.me/+xxxxxxxxxxxxx`\n"
+            "• `http://t.me/joinchat/xxxxxxxxxxxxx`"
+        )
+        return
+
+    try:
+        # Join the channel using user client
+        chat = await user.join_chat(invite_link)
+        
+        # Get chat info
+        chat_title = chat.title or "Unknown"
+        chat_type = "Channel" if chat.type.name == "CHANNEL" else "Group"
+        
+        await message.reply(
+            f"**✅ Successfully joined {chat_type}!**\n\n"
+            f"**📢 {chat_type} Name:** `{chat_title}`\n"
+            f"**🆔 {chat_type} ID:** `{chat.id}`\n\n"
+            "You can now download media from this {}.".format(chat_type.lower())
+        )
+        
+        LOGGER(__name__).info(f"Successfully joined {chat_type}: {chat_title} ({chat.id})")
+        
+    except Exception as e:
+        error_msg = str(e)
+        
+        # Handle specific errors
+        if "INVITE_HASH_EXPIRED" in error_msg:
+            await message.reply("**❌ The invite link has expired.**")
+        elif "USER_ALREADY_PARTICIPANT" in error_msg:
+            await message.reply("**ℹ️ You are already a member of this channel/group.**")
+        elif "CHANNELS_TOO_MUCH" in error_msg:
+            await message.reply("**❌ You have joined too many channels. Please leave some channels first.**")
+        elif "INVITE_HASH_INVALID" in error_msg:
+            await message.reply("**❌ Invalid invite link.**")
+        elif "FLOOD_WAIT" in error_msg:
+            await message.reply("**❌ Rate limited. Please try again later.**")
+        else:
+            await message.reply(f"**❌ Could not join the channel/group.**\n\n**Error:** `{error_msg}`")
+        
+        LOGGER(__name__).error(f"Error joining channel: {e}")
 
 
 @bot.on_message(filters.command("killall") & filters.private)
